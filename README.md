@@ -84,3 +84,5 @@ python stellaris_app.py
 Code is AI-generated and free to use. No rights claimed.
 
 Images in `/resources` are AI-generated.
+
+Last change added mostly untested data extractor that extract data from game itself. 
