@@ -1,0 +1,40 @@
+{
+  "colors": {
+    "background": "#0f172a",
+    "surface": "#16213e",
+    "surface_light": "#1e3a5f",
+    "accent": "#00d4ff",
+    "accent_hover": "#00ffff",
+    "accent_secondary": "#f39c12",
+    "text": "#e0e0e0",
+    "text_dim": "#888888",
+    "error": "#e94560",
+    "success": "#27ae60"
+  },
+  "fonts": {
+    "title": {
+      "family": "Segoe UI",
+      "size": 18,
+      "weight": "bold"
+    },
+    "section": {
+      "family": "Segoe UI",
+      "size": 10,
+      "weight": "bold"
+    },
+    "normal": {
+      "family": "Segoe UI",
+      "size": 10
+    },
+    "entry": {
+      "family": "Segoe UI",
+      "size": 11
+    }
+  },
+  "window": {
+    "width": 950,
+    "height": 750,
+    "title": "Stellaris AI Helper",
+    "resizable": true
+  }
+}
