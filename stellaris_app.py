@@ -13,6 +13,9 @@ import hashlib
 from difflib import get_close_matches
 from PIL import Image, ImageTk
 from datetime import datetime
+from save_watcher import SaveWatcher
+from save_parser import parse_save, save_valid
+from data_extractor import extract_summary, get_empires, get_player_empire
 
 # Handle paths for both script and compiled EXE
 if getattr(sys, 'frozen', False):
@@ -26,7 +29,7 @@ CACHE_FILE = os.path.join(SCRIPT_DIR, "response_cache.json")
 DRAFT_FILE = os.path.join(SCRIPT_DIR, "draft.json")
 DATA_FILE = os.path.join(SCRIPT_DIR, "stellaris_unified_fixed.json")
 
-VERSION = "1.7"
+VERSION = "1.8"
 
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -37,7 +40,8 @@ DEFAULT_CONFIG = {
     "rate_limit_seconds": 2,
     "temperature": 0.4,
     "max_tokens": 2500,
-    "deep_search_mode": False
+    "deep_search_mode": False,
+    "live_data_mode": False
 }
 
 # Rate limiting
@@ -757,12 +761,30 @@ class StellarisApp:
         self.images["ask_hover"] = load_image("ask_hover", size=(50, 20), folder="buttons")
         self.images["clear"] = load_image("clear", size=(25, 15), folder="buttons")
 
+        # Save indicator state
+        self.save_status_var = tk.StringVar(value="No save loaded")
+        self.save_loaded = False
+        self.save_loading = False
+        self.pulse_job = None
+
         self.setup_styles(fonts)
         self.build_ui()
         self.setup_keyboard_shortcuts()
         self.restore_draft()
 
         self.markdown = MarkdownRenderer(self.answer_text, self.colors, fonts)
+        
+        # Live data manager
+        self.live_data = LiveDataManager(
+            status_callback=self.status_var.set,
+            save_status_callback=self.update_save_status
+        )
+
+        save_dir = self.live_data.start_watching()
+        if save_dir:
+            self.status_var.set(f"Watching: {save_dir}")
+        else:
+            self.status_var.set("Ready - no save directory found")
 
         if not DATA_LOADED:
             messagebox.showwarning("Warning",
@@ -999,9 +1021,11 @@ class StellarisApp:
             ttk.Label(header, text=f"Stellaris AI Helper v{VERSION}",
                 style="Title.TLabel").pack(side="left")
 
+        # Right side info frame
         info_frame = ttk.Frame(header, style="Main.TFrame")
         info_frame.pack(side="right")
 
+        # Data sections info
         info_text = f"{len(DATA)} sections loaded" if DATA_LOADED else "No data"
         ttk.Label(info_frame, text=info_text, style="Subtle.TLabel").pack(side="left")
 
@@ -1010,6 +1034,26 @@ class StellarisApp:
             if cache_count > 0:
                 ttk.Label(info_frame, text=f" | {cache_count} cached",
                     style="Subtle.TLabel").pack(side="left", padx=(5, 0))
+
+        # Save indicator (new line below data info)
+        save_frame = ttk.Frame(info_frame, style="Main.TFrame")
+        save_frame.pack(side="left", padx=(15, 0))
+
+        # Status dot canvas
+        self.save_dot = tk.Canvas(save_frame, width=12, height=12,
+            bg=c["background"], highlightthickness=0)
+        self.save_dot.pack(side="left", padx=(0, 5))
+        self.update_save_dot("inactive")
+
+        # Save status label
+        self.save_label = ttk.Label(save_frame, textvariable=self.save_status_var,
+            style="Subtle.TLabel")
+        self.save_label.pack(side="left")
+
+        # Manual scan button 
+        scan_btn = ttk.Button(save_frame, text="🔄", width=3,
+            command=self.manual_scan, style="Flat.TButton")
+        scan_btn.pack(side="left", padx=(5, 0))
 
     def build_settings(self, parent):
         c = self.colors
@@ -1196,6 +1240,14 @@ class StellarisApp:
             text="Include prerequisites (finds related tech tree)",
             variable=self.deep_search_mode,
             style="TCheckbutton").pack(side="left", padx=(20, 0))
+        
+        # NEW: Live game data toggle
+        self.live_data_mode = tk.BooleanVar(
+            value=CONFIG.get("live_data_mode", False))
+        ttk.Checkbutton(conv_row,
+            text="Live game data (from saves)",
+            variable=self.live_data_mode,
+            style="TCheckbutton").pack(side="left", padx=(20, 0))
 
         self.context_label = ttk.Label(conv_row, text="", style="Subtle.TLabel")
         self.context_label.pack(side="right")
@@ -1370,6 +1422,189 @@ class StellarisApp:
         ttk.Button(status_frame, text="About",
             command=self.show_about,
             style="Flat.TButton").pack(side="right")
+        
+    def update_save_dot(self, status):
+        """Update the save indicator dot color. status: 'inactive' (gray), 'loading' (orange pulse), 'active' (green)"""
+        c = self.colors
+        self.save_dot.delete("all")
+
+        if status == "inactive":
+            # Gray dot - no save
+            self.save_dot.create_oval(2, 2, 10, 10, fill="#666666", outline="#555555")
+            self.save_dot.tooltip_text = "No save loaded"
+        elif status == "loading":
+            # Orange dot - loading
+            self.save_dot.create_oval(2, 2, 10, 10, fill="#f39c12", outline="#e67e22")
+            self.save_dot.tooltip_text = "Loading save..."
+        elif status == "active":
+            # Green dot - save loaded
+            self.save_dot.create_oval(2, 2, 10, 10, fill="#27ae60", outline="#1e8449")
+            self.save_dot.tooltip_text = "Save loaded"
+        elif status == "error":
+            # Red dot - error
+            self.save_dot.create_oval(2, 2, 10, 10, fill="#e94560", outline="#c0392b")
+            self.save_dot.tooltip_text = "Error loading save"
+
+    def start_save_pulse(self):
+        """Start pulsing animation for loading state."""
+        self.stop_save_pulse()
+        self.save_loading = True
+        self.pulse_frame = 0
+        self.pulse_colors = ["#f39c12", "#e67e22", "#d68910", "#e67e22"]  # Orange pulse
+        self._animate_pulse()
+
+    def _animate_pulse(self):
+        """Internal pulse animation loop."""
+        if not self.save_loading:
+            return
+
+        color = self.pulse_colors[self.pulse_frame]
+        self.save_dot.delete("all")
+        self.save_dot.create_oval(2, 2, 10, 10, fill=color, outline=color)
+
+        self.pulse_frame = (self.pulse_frame + 1) % len(self.pulse_colors)
+        self.pulse_job = self.root.after(300, self._animate_pulse)
+
+    def stop_save_pulse(self):
+        """Stop pulsing animation."""
+        self.save_loading = False
+        if self.pulse_job:
+            self.root.after_cancel(self.pulse_job)
+            self.pulse_job = None
+
+    def update_save_status(self, status, save_name=None, timestamp=None):
+        """Update save indicator status.
+
+        status: 'none', 'loading', 'loaded', 'error'
+        """
+        self.stop_save_pulse()
+
+        if status == "none":
+            self.save_loaded = False
+            self.update_save_dot("inactive")
+            self.save_status_var.set("No save loaded")
+        elif status == "loading":
+            self.update_save_dot("loading")
+            self.start_save_pulse()
+            self.save_status_var.set("Loading save...")
+        elif status == "loaded":
+            self.save_loaded = True
+            self.update_save_dot("active")
+            if save_name and timestamp:
+                self.save_status_var.set(f"{save_name} ({timestamp})")
+            elif save_name:
+                self.save_status_var.set(save_name)
+            else:
+                self.save_status_var.set("Save loaded")
+        elif status == "error":
+            self.save_loaded = False
+            self.update_save_dot("error")
+            self.save_status_var.set("Save error")
+
+    def manual_scan(self):
+        """Manually trigger a save scan and load latest."""
+        print("\n=== MANUAL SCAN TRIGGERED ===")
+
+        if not self.live_data.watcher:
+            print("No watcher instance!")
+            self.status_var.set("No watcher initialized")
+            return
+
+        save_dir = self.live_data.watcher.save_dir
+        print(f"Save directory: {save_dir}")
+
+        if not save_dir:
+            print("Save directory not found!")
+            self.status_var.set("Save directory not found - check console")
+            messagebox.showwarning("Save Directory", 
+                "Could not find Stellaris save directory.\n\n"
+                "Expected location:\n"
+                "Documents/Paradox Interactive/Stellaris/save games")
+            return
+
+        # List all saves in directory
+        print(f"\nListing all .sav files in: {save_dir}")
+        save_count = 0
+        ironman_count = 0
+        saves_list = []
+
+        for root, dirs, files in os.walk(save_dir):
+            empire_name = os.path.basename(root) if root != save_dir else "Root"
+
+            for f in files:
+                if f.endswith('.sav'):
+                    save_count += 1
+                    path = os.path.join(root, f)
+                    size = os.path.getsize(path)
+                    mtime = os.path.getmtime(path)
+                    mtime_str = time.strftime('%Y-%m-%d %H:%M:%S', 
+                                              time.localtime(mtime))
+
+                    is_ironman = self.is_ironman_save(path)
+                    if is_ironman:
+                        ironman_count += 1
+
+                    saves_list.append({
+                        'name': f,
+                        'path': path,
+                        'empire': empire_name,
+                        'size': size,
+                        'mtime': mtime,
+                        'mtime_str': mtime_str,
+                        'ironman': is_ironman
+                    })
+
+                    print(f"  [{empire_name}] {f}")
+                    print(f"    Size: {size:,} bytes")
+                    print(f"    Modified: {mtime_str}")
+                    print(f"    Ironman: {is_ironman}")
+
+        print(f"\nTotal saves found: {save_count}")
+        print(f"  Ironman: {ironman_count}")
+        print(f"  Normal: {save_count - ironman_count}")
+
+        if save_count == 0:
+            self.status_var.set("No .sav files found")
+            messagebox.showinfo("No Saves", 
+                "No save files found.\n\n"
+                "Make sure you have saved a game in Stellaris.")
+            return
+
+        # Find latest NON-IRONMAN save
+        normal_saves = [s for s in saves_list if not s['ironman']]
+
+        if not normal_saves:
+            self.status_var.set("Only Ironman saves found (encrypted)")
+            messagebox.showwarning("Ironman Saves", 
+                f"Found {save_count} saves, but all are Ironman.\n\n"
+                "Ironman saves are encrypted and cannot be read.\n"
+                "Please create a non-Ironman save to use live data.")
+            return
+
+        # Sort by mtime, get latest
+        latest = max(normal_saves, key=lambda s: s['mtime'])
+        print(f"\nLatest normal save: {latest['name']}")
+        print(f"  Empire: {latest['empire']}")
+        print(f"  Path: {latest['path']}")
+
+        # Update watcher state
+        self.live_data.watcher.last_mtime = latest['mtime']
+        self.live_data.watcher.last_file = latest['path']
+
+        # Load it!
+        print(f"\n>>> LOADING SAVE <<<")
+        self.live_data.on_save_detected(latest['path'])
+
+        self.status_var.set(f"Loaded: {latest['name']}")
+
+    def is_ironman_save(self, file_path):
+        """Check if save is Ironman (encrypted)."""
+        try:
+            with open(file_path, 'rb') as f:
+                header = f.read(4)
+                return header[:2] != b'PK'
+        except:
+            return True    
 
     # --- UI Actions ---
 
@@ -1453,7 +1688,8 @@ class StellarisApp:
             "rate_limit_seconds": rate_limit,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "deep_search_mode": self.deep_search_mode.get()
+            "deep_search_mode": self.deep_search_mode.get(),
+            "live_data_mode": self.live_data_mode.get()
         }
         save_config(config)
 
@@ -1765,6 +2001,36 @@ Keyboard shortcuts:
 
                 context = "\n\n".join(parts)
 
+            # Add live game state to context (only if enabled)
+            print(f"\n=== PREPARING AI CONTEXT ===")
+            print(f"Live data mode: {self.live_data_mode.get()}")
+            print(f"Current summary: {self.live_data.current_summary is not None}")
+
+            if self.live_data_mode.get():
+                live_context = self.live_data.get_live_context()
+                print(f"Live context result: {live_context[:200] if live_context else 'None'}...")
+
+                if live_context:
+                    live_context = (
+                        "=== YOUR CURRENT GAME (from save file) ===\n"
+                        "This is your ACTUAL game state right now.\n"
+                        "Use this for questions about YOUR empire.\n\n"
+                    ) + live_context
+
+                    if context:
+                        context = live_context + "\n\n" + (
+                            "=== GAME REFERENCE DATA (general info) ===\n"
+                            "This is general game information, NOT your save.\n"
+                            "Use this for questions about game mechanics.\n\n"
+                        ) + context
+                    else:
+                        context = live_context
+                    print(f"Live context added ({len(live_context)} chars)")
+                else:
+                    print("WARNING: Live mode on but no live context!")
+            else:
+                print("Live data mode is OFF")         
+
             cache_key = self.get_cache_key(question, matches)
             if CONFIG.get("cache_enabled", True) and cache_key in RESPONSE_CACHE:
                 cached = RESPONSE_CACHE[cache_key]
@@ -1773,23 +2039,54 @@ Keyboard shortcuts:
                     from_cache=True, tokens=total_tokens, has_data=has_game_data))
                 return
 
+            # Build messages based on data availability
             if has_game_data:
-                system_prompt = (
-                    "You are a Stellaris game expert. Use ONLY the provided game data. "
-                    "Be concise and accurate.\n\n"
-                    "FORMATTING RULES (IMPORTANT):\n"
-                    "- Use **bold** for important terms and values\n"
-                    "- Use bullet points for lists\n"
-                    "- Use `code blocks with backticks` for ASCII diagrams and tech trees\n"
-                    "- **NEVER use Markdown tables** (the | column | format). They break in this app.\n"
-                    "- Instead of tables, use simple bullet lists like:\n"
-                    "  • **Path 1**: 17,500 research\n"
-                    "  • **Path 2**: 18,750 research\n\n"
-                    "For tech trees and diagrams, ALWAYS use code blocks with ASCII art.\n\n"
-                    "If the data doesn't contain the answer, say so clearly."
+                # We have game data (static and/or live)
+                has_live_data = (
+                    self.live_data_mode.get() and 
+                    self.live_data.current_summary is not None
                 )
+
+                if has_live_data:
+                    system_prompt = (
+                        "You are a Stellaris game expert helping a player with their CURRENT save file.\n\n"
+                        "CRITICAL: You MUST use the EXACT numbers from 'YOUR CURRENT GAME' section.\n"
+                        "- Do NOT round or approximate numbers\n"
+                        "- Do NOT make up or estimate any values\n"
+                        "- If the save shows 'energy: 2082.49', report EXACTLY '2,082.49'\n\n"
+                        "You have TWO data sources:\n\n"
+                        "1. YOUR CURRENT GAME - This is their ACTUAL save file with:\n"
+                        "   - Exact resource amounts (energy, minerals, alloys, etc.)\n"
+                        "   - Fleet power and ship counts\n"
+                        "   - Planet and pop counts\n"
+                        "   - Research output\n\n"
+                        "2. GAME REFERENCE DATA - General info about technologies, buildings, etc.\n\n"
+                        "When asked about resources, ships, or anything from the save:\n"
+                        "- Quote the EXACT numbers from YOUR CURRENT GAME\n"
+                        "- Include decimal places if present in the data\n"
+                        "- Never invent or round numbers\n\n"
+                        "FORMATTING:\n"
+                        "- Use **bold** for key numbers\n"
+                        "- Use bullet points for lists\n"
+                        "- No markdown tables"
+                    )
+                else:
+                    system_prompt = (
+                        "You are a Stellaris game expert. Use ONLY the provided game data. "
+                        "Be concise and accurate.\n\n"
+                        "FORMATTING RULES:\n"
+                        "- Use **bold** for important terms\n"
+                        "- Use bullet points for lists\n"
+                        "- Use `code blocks` for ASCII diagrams\n"
+                        "- NEVER use markdown tables\n"
+                        "- If data doesn't contain the answer, say so clearly."
+                    )
+
+                # CRITICAL: Set user_content with context!
                 user_content = f"GAME DATA:\n{context}\n\nQUESTION: {question}"
+
             else:
+                # No game data found
                 system_prompt = (
                     "You are a helpful assistant for a Stellaris game helper application. "
                     "The user's question did not match any game data in the database, "
@@ -1803,6 +2100,14 @@ Keyboard shortcuts:
                     "- Simple tables with | col1 | col2 | format"
                 )
                 user_content = question
+                # DEBUG: Show what we're sending
+                print(f"\n=== API REQUEST DEBUG ===")
+                print(f"has_game_data: {has_game_data}")
+                print(f"context length: {len(context) if context else 0}")
+                print(f"context preview: {context[:300] if context else 'None'}...")
+                print(f"user_content length: {len(user_content)}")
+                print(f"user_content preview: {user_content[:500]}...")
+                print("=========================\n")
 
             messages = [{"role": "system", "content": system_prompt}]
 
@@ -1814,6 +2119,24 @@ Keyboard shortcuts:
 
             temperature = CONFIG.get("temperature", 0.4)
             max_tokens = CONFIG.get("max_tokens", 2500)
+
+            # Build messages array
+            messages = [{"role": "system", "content": system_prompt}]
+
+            if self.conversation_mode.get():
+                for msg in self.conversation_history[-20:]:
+                    messages.append(msg)
+
+            messages.append({"role": "user", "content": user_content})
+
+            # DEBUG: Show messages
+            print(f"\n=== MESSAGES DEBUG ===")
+            print(f"Total messages: {len(messages)}")
+            for i, msg in enumerate(messages):
+                print(f"  Message {i}: {msg['role']} - {len(msg['content'])} chars")
+                if i < 2:  # Show first 2 messages
+                    print(f"    Preview: {msg['content'][:200]}...")
+            print("=====================\n")
 
             try:
                 resp = requests.post(
@@ -1886,7 +2209,7 @@ Keyboard shortcuts:
             traceback.print_exc()
             self.root.after(0, lambda: self.show_result(
                 f"Unexpected error:\n{str(e)}",
-                [], question, is_error=True, has_data=False))
+                [], question, is_error=True, has_data=False))   
 
     def parse_api_error(self, response):
         try:
@@ -2003,7 +2326,8 @@ Keyboard shortcuts:
             "rate_limit_seconds": rate_limit,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            "deep_search_mode": self.deep_search_mode.get()
+            "deep_search_mode": self.deep_search_mode.get(),
+            "live_data_mode": self.live_data_mode.get()
         }
         save_config(config)
         save_cache(RESPONSE_CACHE)
@@ -2011,8 +2335,173 @@ Keyboard shortcuts:
         question = self.question_entry.get().strip()
         if question:
             save_draft(question)
-
+            
+        self.live_data.stop_watching()
         self.root.destroy()
+
+class LiveDataManager:
+    """Manages live game data from save files."""
+
+    def __init__(self, status_callback=None, save_status_callback=None):
+        self.status_callback = status_callback
+        self.save_status_callback = save_status_callback  # NEW
+        self.watcher = None
+        self.current_state = None
+        self.current_summary = None
+        self.save_path = None
+
+    def on_save_detected(self, save_path):
+        """Called when a new save is detected."""
+        print(f"\n=== on_save_detected called ===")
+        print(f"Save path: {save_path}")
+
+        self.save_path = save_path
+        save_name = os.path.basename(save_path)
+
+        # Notify UI that loading started
+        if self.save_status_callback:
+            self.save_status_callback('loading')
+
+        try:
+            if self.status_callback:
+                self.status_callback(f"Parsing save: {save_name}")
+
+            print("  Calling parse_save...")
+            meta, state = parse_save(save_path)
+            print(f"  parse_save returned!")
+            print(f"  state is None? {state is None}")
+            print(f"  state type: {type(state)}")
+            if state:
+                print(f"  state keys: {list(state.keys())[:10]}")
+
+            self.current_state = state
+            print(f"  current_state set: {self.current_state is not None}")
+
+            # Get player empire
+            print("  Getting player empire...")
+            empire_id = get_player_empire(state)
+            print(f"  Empire ID: {empire_id}")
+
+            if empire_id is not None:
+                print(f"  Calling extract_summary for empire {empire_id}...")
+                self.current_summary = extract_summary(state, empire_id)
+                print(f"  extract_summary returned: {self.current_summary is not None}")
+            else:
+                print("  No empire_id, trying get_empires...")
+                empires = get_empires(state)
+                print(f"  Empires found: {empires}")
+                if empires:
+                    first_empire = list(empires.keys())[0]
+                    print(f"  Using first empire: {first_empire}")
+                    self.current_summary = extract_summary(state, first_empire)
+                    print(f"  extract_summary returned: {self.current_summary is not None}")
+
+            print(f"  FINAL current_summary: {self.current_summary is not None}")
+            if self.current_summary:
+                print(f"  Summary keys: {list(self.current_summary.keys())}")
+                print(f"  Summary content: {self.current_summary}")
+
+            # Get timestamp from save
+            timestamp = None
+            if self.current_summary:
+                date_str = self.current_summary.get('date', '')
+                if date_str:
+                    timestamp = date_str.replace('.', '/')
+
+            # Notify UI that loading completed
+            if self.save_status_callback:
+                if self.current_summary:
+                    self.save_status_callback('loaded', save_name, timestamp)
+                else:
+                    self.save_status_callback('error')
+
+            if self.status_callback:
+                if self.current_summary:
+                    empire = self.current_summary.get('empire_name', 'Unknown')
+                    self.status_callback(f"Live data loaded: {empire}")
+                else:
+                    self.status_callback("Save parsed, but no empire found")
+
+            print("=== on_save_detected complete ===\n")
+
+        except Exception as e:
+            import traceback
+            print(f"Error parsing save: {e}")
+            traceback.print_exc()
+
+            if self.save_status_callback:
+                self.save_status_callback('error')
+
+            if self.status_callback:
+                self.status_callback(f"Error parsing save: {str(e)[:50]}")
+
+    def start_watching(self, save_dir=None):
+        """Start watching for save file changes."""
+        self.watcher = SaveWatcher(
+            save_dir=save_dir,
+            callback=self.on_save_detected
+        )
+        self.watcher.start()
+
+        return self.watcher.save_dir
+
+    def stop_watching(self):
+        """Stop watching."""
+        if self.watcher:
+            self.watcher.stop()
+
+    def get_live_context(self):
+        """Get formatted context string for AI queries."""
+        if not self.current_summary:
+            return None
+
+        s = self.current_summary
+        lines = [f"=== CURRENT GAME STATE ==="]
+        lines.append(f"Date: {s.get('date', 'Unknown')}")
+        lines.append(f"Empire: {s.get('empire_name', 'Unknown')}")
+
+        if 'economy' in s:
+            eco = s['economy']
+            stock = eco.get('stockpile', {})
+            income = eco.get('income', {})
+
+            lines.append(f"\nResources:")
+            for res in ['minerals', 'energy', 'alloys', 'consumer_goods', 'food']:
+                if res in stock:
+                    amount = stock[res]
+                    # Try to get income too
+                    inc = income.get(res, 0) if isinstance(income, dict) else 0
+                    if inc:
+                        lines.append(f"  • {res}: {amount:,.2f} (+{inc:.1f}/month)")
+                    else:
+                        lines.append(f"  • {res}: {amount:,.2f}")
+
+        if 'fleets' in s:
+            fl = s['fleets']
+            lines.append(f"\nFleets:")
+            lines.append(f"  • Total: {fl.get('total', 0)}")
+            lines.append(f"  • Power: {fl.get('total_power', 0):,}")
+
+        if 'planets' in s:
+            pl = s['planets']
+            lines.append(f"\nPlanets:")
+            lines.append(f"  • Count: {pl.get('total', 0)}")
+            lines.append(f"  • Pops: {pl.get('total_pops', 0):,}")
+
+        if 'tech' in s:
+            t = s['tech']
+            out = t.get('research_output', {})
+            lines.append(f"\nResearch:")
+            lines.append(f"  • Physics: {out.get('physics', 0)}")
+            lines.append(f"  • Society: {out.get('society', 0)}")
+            lines.append(f"  • Engineering: {out.get('engineering', 0)}")
+            lines.append(f"  • Techs completed: {t.get('completed_count', 0)}")
+
+        result = '\n'.join(lines)
+        print(f"  Context length: {len(result)} chars")
+        print(f"  Preview:\n{result[:300]}...")
+
+        return result
 
 if __name__ == "__main__":
     root = tk.Tk()
