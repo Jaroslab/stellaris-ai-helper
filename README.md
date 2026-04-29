@@ -79,12 +79,20 @@ python stellaris_app.py
 - Data does not include species traits or mod content
 - Some wiki information may be missing
 
-## License
-
-Code is AI-generated and free to use. No rights claimed.
-
-Images in `/resources` are AI-generated.
-
 ## Changes
 
-Last change added mostly untested data extractor that extract data from game itself. 
+Live Game Data-
+
+The app can read your actual save files to answer questions about your current game.
+
+How It Works-
+
+1. Enable "Live game data" checkbox
+2. The app watches your Stellaris save directory
+3. When you save in-game, it auto-loads the save (auto saves got checked too)
+4. Ask questions like "How many alloys do I have?" or "What's my fleet power?"
+
+Requirements-
+
+- Non-Ironman saves only (Ironman saves are encrypted)
+- Save must be uncompressed (normal save, not ironman)
