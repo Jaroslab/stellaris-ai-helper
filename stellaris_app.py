@@ -1,5 +1,5 @@
 # stellaris_app.py
-# Version 1.7 - Added table rendering, deep search for prerequisites
+# Version 1.9 - Added table rendering, deep search for prerequisites
 import tkinter as tk
 from tkinter import ttk, messagebox
 import json
@@ -27,9 +27,10 @@ RESOURCE_DIR = os.path.join(SCRIPT_DIR, "resources")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "stellaris_config.json")
 CACHE_FILE = os.path.join(SCRIPT_DIR, "response_cache.json")
 DRAFT_FILE = os.path.join(SCRIPT_DIR, "draft.json")
-DATA_FILE = os.path.join(SCRIPT_DIR, "stellaris_unified_fixed.json")
+DATA_FILE = os.path.join(SCRIPT_DIR, "source data", "stellaris_unified_fixed.json")
+GAME_DATA_FILE = os.path.join(SCRIPT_DIR, "source data", "stellaris_game_data.json")
 
-VERSION = "1.8"
+VERSION = "1.9"
 
 DEFAULT_CONFIG = {
     "api_key": "",
@@ -219,6 +220,24 @@ except Exception as e:
     DATA_LOADED = False
     DATA_ISSUES = [f"Load error: {e}"]
 
+try:
+    with open(GAME_DATA_FILE, "r", encoding="utf-8") as f:
+        GAME_DATA = json.load(f)
+    GAME_DATA_LOADED = True
+    GAME_DATA_ISSUES = validate_data(GAME_DATA)
+except FileNotFoundError:
+    GAME_DATA = {}
+    GAME_DATA_LOADED = False
+    GAME_DATA_ISSUES = ["Game data file not found"]
+except json.JSONDecodeError as e:
+    GAME_DATA = {}
+    GAME_DATA_LOADED = False
+    GAME_DATA_ISSUES = [f"Game data invalid JSON: {e}"]
+except Exception as e:
+    GAME_DATA = {}
+    GAME_DATA_LOADED = False
+    GAME_DATA_ISSUES = [f"Game data load error: {e}"]
+
 def search(query, max_results=5):
     """Search for matching data with complete recursive search."""
     if not DATA_LOADED or not query:
@@ -353,6 +372,143 @@ def search(query, max_results=5):
     # Sort and return top results
     found_items.sort(key=lambda x: (-x[2], x[0]))
     return found_items[:max_results]
+
+def search_game(query, max_results=5):
+    """Search game extracted data. Same logic as search(), different source."""
+    if not GAME_DATA_LOADED or not query:
+        return []
+
+    query_lower = query.lower()
+    query_norm = query_lower.replace("-", "").replace("_", "").replace(" ", "")
+    query_words = [w for w in re.findall(r'\b\w+\b', query_lower) if len(w) > 2]
+
+    found_items = []
+    seen_keys = set()
+
+    def get_item_key(item):
+        """Get unique key for deduplication."""
+        item_id = str(item.get("id", "")).lower()
+        item_name = str(item.get("name", "")).lower()
+        if not item_id and not item_name:
+            return json.dumps(item, sort_keys=True, default=str)
+        return (item_id, item_name)
+
+    def score_item(item):
+        """Score how well an item matches the query."""
+        item_name = str(item.get("name", "")).lower()
+        item_id = str(item.get("id", "")).lower()
+        item_name_norm = item_name.replace("-", "").replace("_", "").replace(" ", "")
+        item_id_norm = item_id.replace("-", "").replace("_", "").replace(" ", "")
+
+        # 1. Exact normalized match
+        if query_norm == item_name_norm or query_norm == item_id_norm:
+            return 500
+
+        # 2. Item name is INSIDE the query
+        if len(item_name_norm) >= 3 and item_name_norm in query_norm:
+            return 300
+        if len(item_id_norm) >= 3 and item_id_norm in query_norm:
+            return 280
+
+        # 3. Query is inside the item name
+        if len(query_norm) >= 3 and (item_name_norm and query_norm in item_name_norm):
+            return 250
+        if len(query_norm) >= 3 and (item_id_norm and query_norm in item_id_norm):
+            return 240
+
+        score = 0
+
+        # 4. Word matching
+        for qw in query_words:
+            if qw in item_name or qw in item_id:
+                score += 30
+
+        # 5. Prerequisites matching for tech questions
+        prereq_str = ""
+        for field in ["prerequisites", "prereq", "requires"]:
+            val = item.get(field)
+            if val:
+                if isinstance(val, dict):
+                    prereq_str += json.dumps(val).lower()
+                elif isinstance(val, list):
+                    prereq_str += " ".join(str(v) for v in val).lower()
+                else:
+                    prereq_str += str(val).lower()
+
+        tech_keywords = [
+            'prerequisite', 'need', 'require', 'unlock', 'tree', 'research',
+            'path', 'way', 'route', 'get', 'before', 'after', 'lead'
+        ]
+        is_tech_query = any(kw in query_lower for kw in tech_keywords)
+        if is_tech_query and prereq_str:
+            score += 50
+
+        for qw in query_words:
+            if qw in prereq_str:
+                score += 20
+
+        return score
+
+    def recursive_search(data, path=""):
+        """Recursively search through ALL nested structures."""
+        if isinstance(data, dict):
+            # Check if this dict is an item
+            if "name" in data or "id" in data or "tier" in data:
+                key = get_item_key(data)
+                if key not in seen_keys:
+                    score = score_item(data)
+                    if score > 0:
+                        seen_keys.add(key)
+                        found_items.append((path, data, score))
+
+            # Recurse into children (skip long text fields)
+            for key, value in data.items():
+                if key in ["description", "sources", "image", "icon"]:
+                    continue
+                child_path = f"{path}/{key}" if path else key
+                recursive_search(value, child_path)
+
+        elif isinstance(data, list):
+            for i, item in enumerate(data):
+                child_path = f"{path}[{i}]"
+                if isinstance(item, dict):
+                    if "name" in item or "id" in item or "tier" in item:
+                        key = get_item_key(item)
+                        if key not in seen_keys:
+                            score = score_item(item)
+                            if score > 0:
+                                seen_keys.add(key)
+                                found_items.append((child_path, item, score))
+                    recursive_search(item, child_path)
+
+    # Run recursive search - USE GAME_DATA HERE
+    recursive_search(GAME_DATA)
+
+    # Section key fallback (lower priority) - USE GAME_DATA HERE
+    for key in GAME_DATA.keys():
+        key_lower = key.lower()
+        key_score = 0
+
+        if query_lower == key_lower:
+            key_score = 100
+        elif query_lower in key_lower:
+            key_score = 50
+        elif key_lower in query_lower:
+            key_score = 30
+        else:
+            for qw in query_words:
+                if qw in key_lower:
+                    key_score += 10
+
+        if key_score > 0 and (key_score >= 80 or not found_items):
+            found_items.append((key, GAME_DATA[key], key_score))
+
+    # Sort and return top results
+    found_items.sort(key=lambda x: (-x[2], x[0]))
+    return found_items[:max_results]
+
+
+    
 
 def extract_references(item_data):
     """Extract all IDs referenced in prerequisites, requires, unlocks, etc."""
@@ -1248,6 +1404,13 @@ class StellarisApp:
             text="Live game data (from saves)",
             variable=self.live_data_mode,
             style="TCheckbutton").pack(side="left", padx=(20, 0))
+        
+        self.game_data_mode = tk.BooleanVar(
+            value=CONFIG.get("game_data_mode", True))
+        ttk.Checkbutton(conv_row,
+            text="Game extracted data",
+            variable=self.game_data_mode,
+            style="TCheckbutton").pack(side="left", padx=(20, 0))
 
         self.context_label = ttk.Label(conv_row, text="", style="Subtle.TLabel")
         self.context_label.pack(side="right")
@@ -1906,13 +2069,30 @@ Keyboard shortcuts:
 
     def _ask_thread(self, question):
         try:
-            matches = search(question) if DATA_LOADED else []
-            has_game_data = len(matches) > 0
+            matches = []
+            has_game_data = False
+
+            # Search wiki data (existing)
+            if DATA_LOADED:
+                wiki_matches = search(question)
+                for m in wiki_matches:
+                    # Add source tag to each match
+                    matches.append((m[0], m[1], m[2], "wiki"))
+                if wiki_matches:
+                    has_game_data = True
+
+            # Search game data (new, if enabled)
+            if GAME_DATA_LOADED and self.game_data_mode.get():
+                game_matches = search_game(question)  # Same logic, different data
+                for m in game_matches:
+                    matches.append((m[0], m[1], m[2], "game"))
+                if game_matches:
+                    has_game_data = True
 
             print(f"\n=== SEARCH DEBUG ===")
             print(f"Query: {question}")
             print(f"Found {len(matches)} matches:")
-            for key, data, score in matches:
+            for key, data, score, source in matches:
                 name = data.get("name", data.get("id", "???"))
                 has_id = "id" in data
                 print(f"  - {name} (score: {score}, has id: {has_id})")
@@ -1923,8 +2103,8 @@ Keyboard shortcuts:
             all_items = []
 
             if has_game_data:
-                for key, value, _ in matches:
-                    all_items.append((key, value, False))
+                for key, value, score, source in matches:
+                    all_items.append((key, value, False, source))
 
                 # Deep search: Find prerequisite chain
                 if self.deep_search_mode.get() and matches:
@@ -1934,7 +2114,7 @@ Keyboard shortcuts:
                     best_item_name = None
                     best_priority = -1
 
-                    for key, data, score in matches:
+                    for key, data, score, source in matches:
                         if not isinstance(data, dict):
                             continue
 
@@ -1985,19 +2165,19 @@ Keyboard shortcuts:
 
                         for key, item in prereq_items:
                             if not any(ai[0] == key for ai in all_items):
-                                all_items.append((key, item, True))
+                                all_items.append((key, item, True, "game"))
                     else:
                         print("Deep search: No valid item found to start from!")
 
                 parts = []
-                for key, value, is_prereq in all_items:
+                for key, value, is_prereq, source in all_items:
                     text = json.dumps(value, indent=2, ensure_ascii=False)
                     if len(text) > 2500:
                         text = text[:2500] + "\n...[truncated]"
 
-                    label = "PREREQUISITE: " if is_prereq else ""
-                    parts.append(f"=== {label}{key.upper()} ===\n{text}")
-                    total_tokens += estimate_tokens(text)
+                    source_label = "WIKI" if source == "wiki" else "GAME"
+                    prereq_label = "PREREQUISITE: " if is_prereq else ""
+                    parts.append(f"=== [{source_label}] {prereq_label}{key.upper()} ===\n{text}")
 
                 context = "\n\n".join(parts)
 
@@ -2061,6 +2241,10 @@ Keyboard shortcuts:
                         "   - Planet and pop counts\n"
                         "   - Research output\n\n"
                         "2. GAME REFERENCE DATA - General info about technologies, buildings, etc.\n\n"
+                        "Data sections are labeled [WIKI] or [GAME]:\n"
+                        "- [WIKI] data = human descriptions, may be outdated\n"
+                        "- [GAME] data = accurate stats from current game version\n\n"
+                        "When numbers conflict, use [GAME] data for stats.\n\n"
                         "When asked about resources, ships, or anything from the save:\n"
                         "- Quote the EXACT numbers from YOUR CURRENT GAME\n"
                         "- Include decimal places if present in the data\n"
@@ -2074,6 +2258,10 @@ Keyboard shortcuts:
                     system_prompt = (
                         "You are a Stellaris game expert. Use ONLY the provided game data. "
                         "Be concise and accurate.\n\n"
+                        "Data sections are labeled [WIKI] or [GAME]:\n"
+                        "- [WIKI] data = human descriptions, may be outdated\n"
+                        "- [GAME] data = accurate stats from current game version\n\n"
+                        "When numbers conflict, use [GAME] data for stats.\n\n"
                         "FORMATTING RULES:\n"
                         "- Use **bold** for important terms\n"
                         "- Use bullet points for lists\n"
@@ -2382,6 +2570,10 @@ class LiveDataManager:
             empire_id = get_player_empire(state)
             print(f"  Empire ID: {empire_id}")
 
+            # DEBUG: Show save structure
+            from data_extractor import debug_save_structure
+            debug_save_structure(state, empire_id)
+
             if empire_id is not None:
                 print(f"  Calling extract_summary for empire {empire_id}...")
                 self.current_summary = extract_summary(state, empire_id)
@@ -2464,23 +2656,53 @@ class LiveDataManager:
             eco = s['economy']
             stock = eco.get('stockpile', {})
             income = eco.get('income', {})
+            spending = eco.get('spending', {})
 
             lines.append(f"\nResources:")
-            for res in ['minerals', 'energy', 'alloys', 'consumer_goods', 'food']:
-                if res in stock:
-                    amount = stock[res]
-                    # Try to get income too
-                    inc = income.get(res, 0) if isinstance(income, dict) else 0
-                    if inc:
-                        lines.append(f"  • {res}: {amount:,.2f} (+{inc:.1f}/month)")
-                    else:
-                        lines.append(f"  • {res}: {amount:,.2f}")
+            for res in ['energy', 'minerals', 'food', 'alloys', 'consumer_goods']:
+                if res not in stock:
+                    continue
+
+                amount = stock[res]
+
+                # Calculate totals
+                total_income = 0
+                total_spending = 0
+                top_expenses = []
+
+                if isinstance(income, dict):
+                    for source, values in income.items():
+                        if isinstance(values, dict) and res in values:
+                            total_income += float(values[res])
+
+                if isinstance(spending, dict):
+                    for category, values in spending.items():
+                        if isinstance(values, dict) and res in values:
+                            val = float(values[res])
+                            total_spending += val
+                            top_expenses.append((category, val))
+
+                # Sort expenses by amount (highest first)
+                top_expenses.sort(key=lambda x: -x[1])
+                net = total_income - total_spending
+
+                # Format net
+                sign = "+" if net >= 0 else ""
+                net_str = f"{sign}{net:.1f}/month"
+
+                # Build line
+                if total_spending > 0:
+                    # Show top 3 expenses
+                    expense_str = ", ".join([f"{cat}({v:.1f})" for cat, v in top_expenses[:3]])
+                    lines.append(f"  • {res}: {amount:,.2f} ({net_str})")
+                    lines.append(f"      Expenses: {expense_str}")
+                else:
+                    lines.append(f"  • {res}: {amount:,.2f} ({net_str})")
 
         if 'fleets' in s:
             fl = s['fleets']
-            lines.append(f"\nFleets:")
-            lines.append(f"  • Total: {fl.get('total', 0)}")
-            lines.append(f"  • Power: {fl.get('total_power', 0):,}")
+            lines.append(f"\nMilitary:")
+            lines.append(f"  • Fleet Power: {fl.get('total_power', 0):,.0f}")
 
         if 'planets' in s:
             pl = s['planets']
@@ -2492,16 +2714,25 @@ class LiveDataManager:
             t = s['tech']
             out = t.get('research_output', {})
             lines.append(f"\nResearch:")
-            lines.append(f"  • Physics: {out.get('physics', 0)}")
-            lines.append(f"  • Society: {out.get('society', 0)}")
-            lines.append(f"  • Engineering: {out.get('engineering', 0)}")
-            lines.append(f"  • Techs completed: {t.get('completed_count', 0)}")
+            lines.append(f"  • Output: Physics({out.get('physics', 0):.1f}), "
+                       f"Society({out.get('society', 0):.1f}), "
+                       f"Engineering({out.get('engineering', 0):.1f})")
+            lines.append(f"  • Techs Researched: {t.get('completed_count', 0)}")
 
-        result = '\n'.join(lines)
-        print(f"  Context length: {len(result)} chars")
-        print(f"  Preview:\n{result[:300]}...")
+            current = t.get('current_research', {})
+            if current:
+                lines.append(f"  • Currently Researching:")
+                for field in ['physics', 'society', 'engineering']:
+                    if field in current:
+                        data = current[field]
+                        tech = data.get('tech', 'Unknown')
+                        # Clean up tech name
+                        tech = tech.replace('tech_', '').replace('_', ' ').title()
+                        progress = data.get('progress', 0)
+                        status = "Project" if data.get('is_project') else f"{progress:.0f} progress"
+                        lines.append(f"      {field.capitalize()}: {tech} ({status})")
 
-        return result
+        return '\n'.join(lines)
 
 if __name__ == "__main__":
     root = tk.Tk()

@@ -116,29 +116,21 @@ def get_economy(state, empire_id):
 
 def get_fleets(state, empire_id):
     """Extract fleet data for an empire."""
-    if 'fleet' not in state:
+    if 'country' not in state:
         return None
 
-    empire_fleets = {}
+    empire = state['country'].get(empire_id)
+    if not isinstance(empire, dict):
+        return None
 
-    for fid, fleet in state['fleet'].items():
-        if not isinstance(fleet, dict):
-            continue
-        if fleet.get('owner') != empire_id:
-            continue
-        if fleet.get('civilian') == 'yes' or fleet.get('station') == 'yes':
-            continue
-
-        empire_fleets[fid] = {
-            'power': fleet.get('military_power', 0),
-            'ships': len(fleet.get('ships', [])),
-            'name': fleet.get('name', 'Unknown')
-        }
+    # Military power is stored at country level
+    # Note: This may include power from allies/subjects in some cases
+    military_power = empire.get('military_power', 0)
 
     return {
-        'total': len(empire_fleets),
-        'total_power': sum(f['power'] for f in empire_fleets.values()),
-        'fleets': empire_fleets
+        'total': 1 if military_power > 0 else 0,
+        'total_power': round(military_power, 1),
+        'fleets': {}
     }
 
 def get_tech(state, empire_id):
@@ -152,16 +144,53 @@ def get_tech(state, empire_id):
 
     try:
         tech_status = empire.get('tech_status', {})
-        completed = tech_status.get('technology', {})
 
-        # Get research output from budget
+        # Completed techs
+        completed = tech_status.get('technology', {})
+        if isinstance(completed, list):
+            completed_count = len(completed)
+        elif isinstance(completed, dict):
+            completed_count = len(completed)
+        else:
+            completed_count = 0
+
+        # Current research queues
+        current_research = {}
+
+        for queue_name, queue_key in [
+            ('physics', 'physics_queue'),
+            ('society', 'society_queue'),
+            ('engineering', 'engineering_queue')
+        ]:
+            queue = tech_status.get(queue_key, [])
+            if queue and isinstance(queue, list) and len(queue) > 0:
+                first_item = queue[0]
+                if isinstance(first_item, dict):
+                    tech_name = first_item.get('technology', 'Unknown')
+                    progress = first_item.get('progress', 0)
+                    # Check if it's a special project
+                    is_project = 'special_project' in first_item
+                    current_research[queue_name] = {
+                        'tech': tech_name,
+                        'progress': progress,
+                        'is_project': is_project
+                    }
+
+        # Research output from budget
         budget = empire.get('budget', {}).get('current_month', {}).get('income', {})
-        physics = sum(v.get('physics_research', 0) for v in budget.values() if isinstance(v, dict))
-        society = sum(v.get('society_research', 0) for v in budget.values() if isinstance(v, dict))
-        engineering = sum(v.get('engineering_research', 0) for v in budget.values() if isinstance(v, dict))
+        physics = 0
+        society = 0
+        engineering = 0
+
+        for source, values in budget.items():
+            if isinstance(values, dict):
+                physics += float(values.get('physics_research', 0))
+                society += float(values.get('society_research', 0))
+                engineering += float(values.get('engineering_research', 0))
 
         return {
-            'completed_count': len(completed) if isinstance(completed, dict) else 0,
+            'completed_count': completed_count,
+            'current_research': current_research,
             'research_output': {
                 'physics': physics,
                 'society': society,
@@ -174,29 +203,47 @@ def get_tech(state, empire_id):
 
 def get_planets(state, empire_id):
     """Extract planet data for an empire."""
-    if 'planets' not in state:
-        return None
-
     planets = []
+    total_pops = 0
 
-    for pid, planet in state['planets'].get('planet', {}).items():
+    planet_dict = state.get('planets', {}).get('planet', {})
+
+    for pid, planet in planet_dict.items():
         if not isinstance(planet, dict):
             continue
         if planet.get('owner') != empire_id:
             continue
 
+        # Count pops from pop_groups (not 'pop' field)
+        planet_pops = 0
+        pop_groups = planet.get('pop_groups', {})
+        if isinstance(pop_groups, dict):
+            for group_id, group_data in pop_groups.items():
+                if isinstance(group_data, dict) and 'pops' in group_data:
+                    pops = group_data['pops']
+                    if isinstance(pops, list):
+                        planet_pops += len(pops)
+                    elif isinstance(pops, dict):
+                        planet_pops += len(pops)
+
+        # Also check num_sapient_pops field
+        if planet_pops == 0 and 'num_sapient_pops' in planet:
+            planet_pops = planet.get('num_sapient_pops', 0)
+
+        total_pops += planet_pops
+
         planets.append({
             'name': planet.get('name', 'Unknown'),
-            'pops': len(planet.get('pop', [])),
-            'districts': len(planet.get('district', {})),
-            'buildings': len(planet.get('buildings', [])),
+            'pops': planet_pops,
+            'districts': len(planet.get('districts', {})) if isinstance(planet.get('districts'), dict) else 0,
+            'buildings': len(planet.get('buildings_cache', {})) if isinstance(planet.get('buildings_cache'), dict) else 0,
             'stability': planet.get('stability', 0),
             'crime': planet.get('crime', 0)
         })
 
     return {
         'total': len(planets),
-        'total_pops': sum(p['pops'] for p in planets),
+        'total_pops': total_pops,
         'planets': planets
     }
 
@@ -283,3 +330,168 @@ def extract_summary(state, empire_id=None):
     print("=== extract_summary done ===\n")
 
     return summary
+
+def debug_save_structure(state, empire_id=0):
+    """Print detailed structure of save data for debugging."""
+    print("\n" + "="*60)
+    print("SAVE DATA STRUCTURE DEBUG")
+    print("="*60)
+
+    # 1. POP DATA
+    print("\n--- POP DATA ---")
+    if 'pop' in state:
+        pop_data = state['pop']
+        print(f"state['pop'] exists: {type(pop_data)}")
+        if isinstance(pop_data, dict):
+            print(f"  Total pops: {len(pop_data)}")
+            # Show first pop structure
+            if pop_data:
+                first_pop_key = list(pop_data.keys())[0]
+                first_pop = pop_data[first_pop_key]
+                print(f"  First pop key: {first_pop_key}")
+                print(f"  First pop fields: {list(first_pop.keys()) if isinstance(first_pop, dict) else type(first_pop)}")
+        elif isinstance(pop_data, list):
+            print(f"  Total pops: {len(pop_data)}")
+    else:
+        print("state['pop'] NOT FOUND")
+
+    # 2. FLEET DATA
+    print("\n--- FLEET DATA ---")
+    if 'fleet' in state:
+        fleet_data = state['fleet']
+        print(f"state['fleet'] exists: {type(fleet_data)}")
+        if isinstance(fleet_data, dict):
+            print(f"  Total fleets: {len(fleet_data)}")
+            # Find player fleets
+            player_fleets = []
+            for fid, fleet in fleet_data.items():
+                if isinstance(fleet, dict) and fleet.get('owner') == empire_id:
+                    player_fleets.append((fid, fleet))
+            print(f"  Player fleets (owner={empire_id}): {len(player_fleets)}")
+
+            if player_fleets:
+                fid, first_fleet = player_fleets[0]
+                print(f"  First fleet fields: {list(first_fleet.keys())}")
+                print(f"  military_power: {first_fleet.get('military_power', 'N/A')}")
+                print(f"  ships: {first_fleet.get('ships', 'N/A')}")
+    else:
+        print("state['fleet'] NOT FOUND")
+
+    # 3. SHIP DATA (separate from fleet)
+    print("\n--- SHIP DATA ---")
+    if 'ships' in state:
+        ships_data = state['ships']
+        print(f"state['ships'] exists: {type(ships_data)}")
+        if isinstance(ships_data, dict):
+            print(f"  Total ships: {len(ships_data)}")
+    else:
+        print("state['ships'] NOT FOUND")
+
+    # FLEET DEBUG - Find why owner matching fails
+    print("\n--- FLEET OWNER DEBUG ---")
+    if 'fleet' in state:
+        for fid, fleet in list(state['fleet'].items())[:5]:
+            print(f"  Fleet {fid}: owner={fleet.get('owner')}, type={type(fleet.get('owner'))}")
+
+    print("\n--- SHIP OWNER DEBUG ---")
+    if 'ships' in state:
+        for sid, ship in list(state['ships'].items())[:5]:
+            print(f"  Ship {sid}: owner={ship.get('owner')}, type={type(ship.get('owner'))}")
+
+    # 4. TECH DATA
+    print("\n--- TECH DATA ---")
+    countries = state.get('country', {})
+    empire = countries.get(empire_id, {})
+
+    if 'tech_status' in empire:
+        tech_status = empire['tech_status']
+        print(f"tech_status exists: {type(tech_status)}")
+        if isinstance(tech_status, dict):
+            print(f"  tech_status fields: {list(tech_status.keys())}")
+
+            # Look for completed techs
+            if 'technology' in tech_status:
+                techs = tech_status['technology']
+                print(f"  technology type: {type(techs)}")
+                if isinstance(techs, dict):
+                    print(f"  Completed techs count: {len(techs)}")
+                    # Show first few
+                    for i, (tech_id, tech_data) in enumerate(techs.items()):
+                        if i >= 3:
+                            break
+                        print(f"    {tech_id}: {type(tech_data)}")
+                        if isinstance(tech_data, dict):
+                            print(f"      fields: {list(tech_data.keys())[:5]}")
+
+            # Alternative locations
+            for key in tech_status.keys():
+                if 'progress' in key.lower() or 'research' in key.lower() or 'complete' in key.lower():
+                    print(f"  Found '{key}': {tech_status[key]}")
+    else:
+        print("tech_status NOT FOUND in empire")
+
+    # 5. ECONOMY/RESOURCE DATA
+    print("\n--- RESOURCE DATA ---")
+    if 'modules' in empire:
+        modules = empire['modules']
+        print(f"modules exists: {type(modules)}")
+        if isinstance(modules, dict):
+            print(f"  module keys: {list(modules.keys())[:10]}")
+
+            # Look for economy module
+            for mod_name in ['standard_economy_module', 'economy', 'resources']:
+                if mod_name in modules:
+                    mod = modules[mod_name]
+                    print(f"\n  {mod_name}:")
+                    if isinstance(mod, dict):
+                        print(f"    fields: {list(mod.keys())}")
+                        if 'resources' in mod:
+                            print(f"    resources: {mod['resources']}")
+    else:
+        print("modules NOT FOUND in empire")
+
+    # Budget data
+    if 'budget' in empire:
+        budget = empire['budget']
+        print(f"\nbudget exists: {type(budget)}")
+        if isinstance(budget, dict):
+            print(f"  budget fields: {list(budget.keys())}")
+            if 'current_month' in budget:
+                cm = budget['current_month']
+                print(f"  current_month fields: {list(cm.keys()) if isinstance(cm, dict) else cm}")
+    else:
+        print("budget NOT FOUND in empire")
+
+    # 6. PLANET DATA
+    print("\n--- PLANET DATA ---")
+    if 'planets' in state:
+        planets_data = state['planets']
+        print(f"state['planets'] exists: {type(planets_data)}")
+        if isinstance(planets_data, dict):
+            if 'planet' in planets_data:
+                planets = planets_data['planet']
+                print(f"  Total planets: {len(planets) if isinstance(planets, dict) else 'N/A'}")
+            else:
+                print(f"  planets_data keys: {list(planets_data.keys())[:5]}")
+    else:
+        print("state['planets'] NOT FOUND")
+
+    # Look for planets owned by player
+    print(f"\n  Looking for planets owned by empire {empire_id}...")
+    planet_count = 0
+    if 'planets' in state and isinstance(state['planets'], dict):
+        planet_dict = state['planets'].get('planet', state['planets'])
+        for pid, planet in (planet_dict.items() if isinstance(planet_dict, dict) else []):
+            if isinstance(planet, dict) and planet.get('owner') == empire_id:
+                planet_count += 1
+                if planet_count == 1:  # Show first planet structure
+                    print(f"  First planet fields: {list(planet.keys())}")
+                    if 'pop' in planet:
+                        print(f"    planet['pop']: {planet['pop']}")
+                    if 'pop_charts' in planet:
+                        print(f"    planet['pop_charts']: {type(planet['pop_charts'])}")
+    print(f"  Planets owned by player: {planet_count}")
+
+    print("\n" + "="*60)
+    print("END DEBUG")
+    print("="*60 + "\n")
